@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pylint: disable=C,R,W
 """Utility functions used across Superset"""
 from __future__ import absolute_import
 from __future__ import division
@@ -12,6 +13,7 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate
+import errno
 import functools
 import json
 import logging
@@ -25,9 +27,10 @@ import zlib
 import bleach
 import celery
 from dateutil.parser import parse
-from flask import flash, Markup, render_template
+from dateutil.relativedelta import relativedelta
+from flask import flash, g, Markup, render_template
 from flask_babel import gettext as __
-from flask_cache import Cache
+from flask_caching import Cache
 import markdown as md
 import numpy
 import pandas as pd
@@ -47,6 +50,10 @@ logging.getLogger('MARKDOWN').setLevel(logging.INFO)
 PY3K = sys.version_info >= (3, 0)
 EPOCH = datetime(1970, 1, 1)
 DTTM_ALIAS = '__timestamp'
+ADHOC_METRIC_EXPRESSION_TYPES = {
+    'SIMPLE': 'SIMPLE',
+    'SQL': 'SQL',
+}
 
 JS_MAX_INTEGER = 9007199254740991   # Largest int Java Script can handle 2^53-1
 
@@ -304,7 +311,6 @@ def datetime_f(dttm):
 
 
 def base_json_conv(obj):
-
     if isinstance(obj, numpy.int64):
         return int(obj)
     elif isinstance(obj, numpy.bool_):
@@ -317,6 +323,11 @@ def base_json_conv(obj):
         return str(obj)
     elif isinstance(obj, timedelta):
         return str(obj)
+    elif isinstance(obj, bytes):
+        try:
+            return '{}'.format(obj)
+        except Exception:
+            return '[bytes]'
 
 
 def json_iso_dttm_ser(obj, pessimistic=False):
@@ -714,8 +725,7 @@ def merge_extra_filters(form_data):
         if 'filters' not in form_data:
             form_data['filters'] = []
         date_options = {
-            '__from': 'since',
-            '__to': 'until',
+            '__time_range': 'time_range',
             '__time_col': 'granularity_sqla',
             '__time_grain': 'time_grain_sqla',
             '__time_origin': 'druid_time_origin',
@@ -727,7 +737,7 @@ def merge_extra_filters(form_data):
             return f['col'] + '__' + f['op']
         existing_filters = {}
         for existing in form_data['filters']:
-            if existing['col'] is not None:
+            if existing['col'] is not None and existing['val'] is not None:
                 existing_filters[get_filter_key(existing)] = existing['val']
         for filtr in form_data['extra_filters']:
             # Pull out time filters/options and merge into form data
@@ -804,11 +814,156 @@ def get_or_create_main_db():
 
 
 def is_adhoc_metric(metric):
-    return (isinstance(metric, dict) and
-            metric['column'] and
-            metric['aggregate'] and
-            metric['label'])
+    return (
+        isinstance(metric, dict) and
+        (
+            (
+                metric['expressionType'] == ADHOC_METRIC_EXPRESSION_TYPES['SIMPLE'] and
+                metric['column'] and
+                metric['aggregate']
+            ) or
+            (
+                metric['expressionType'] == ADHOC_METRIC_EXPRESSION_TYPES['SQL'] and
+                metric['sqlExpression']
+            )
+        ) and
+        metric['label']
+    )
+
+
+def get_metric_name(metric):
+    return metric['label'] if is_adhoc_metric(metric) else metric
 
 
 def get_metric_names(metrics):
-    return [metric['label'] if is_adhoc_metric(metric) else metric for metric in metrics]
+    return [get_metric_name(metric) for metric in metrics]
+
+
+def ensure_path_exists(path):
+    try:
+        os.makedirs(path)
+    except OSError as exc:
+        if not (os.path.isdir(path) and exc.errno == errno.EEXIST):
+            raise
+
+
+def get_since_until(form_data):
+    """Return `since` and `until` from form_data.
+
+    This functiom supports both reading the keys separately (from `since` and
+    `until`), as well as the new `time_range` key. Valid formats are:
+
+        - ISO 8601
+        - X days/years/hours/day/year/weeks
+        - X days/years/hours/day/year/weeks ago
+        - X days/years/hours/day/year/weeks from now
+        - freeform
+
+    Additionally, for `time_range` (these specify both `since` and `until`):
+
+        - Last day
+        - Last week
+        - Last month
+        - Last quarter
+        - Last year
+        - No filter
+        - Last X seconds/minutes/hours/days/weeks/months/years
+        - Next X seconds/minutes/hours/days/weeks/months/years
+
+    """
+    separator = ' : '
+    today = parse_human_datetime('today')
+    common_time_frames = {
+        'Last day': (today - relativedelta(days=1), today),
+        'Last week': (today - relativedelta(weeks=1), today),
+        'Last month': (today - relativedelta(months=1), today),
+        'Last quarter': (today - relativedelta(months=3), today),
+        'Last year': (today - relativedelta(years=1), today),
+    }
+
+    if 'time_range' in form_data:
+        time_range = form_data['time_range']
+        if separator in time_range:
+            since, until = time_range.split(separator, 1)
+            since = parse_human_datetime(since)
+            until = parse_human_datetime(until)
+        elif time_range in common_time_frames:
+            since, until = common_time_frames[time_range]
+        elif time_range == 'No filter':
+            since = until = None
+        else:
+            rel, num, grain = time_range.split()
+            if rel == 'Last':
+                since = today - relativedelta(**{grain: int(num)})
+                until = today
+            else:  # rel == 'Next'
+                since = today
+                until = today + relativedelta(**{grain: int(num)})
+    else:
+        since = form_data.get('since', '')
+        if since:
+            since_words = since.split(' ')
+            grains = ['days', 'years', 'hours', 'day', 'year', 'weeks']
+            if len(since_words) == 2 and since_words[1] in grains:
+                since += ' ago'
+        since = parse_human_datetime(since)
+        until = parse_human_datetime(form_data.get('until', 'now'))
+
+    return since, until
+
+
+def since_until_to_time_range(form_data):
+    if 'time_range' in form_data:
+        return
+
+    since = form_data.get('since', '')
+    until = form_data.get('until', 'now')
+    form_data['time_range'] = ' : '.join((since, until))
+
+
+def split_adhoc_filters_into_base_filters(fd):
+    """
+    Mutates form data to restructure the adhoc filters in the form of the four base
+    filters, `where`, `having`, `filters`, and `having_filters` which represent
+    free form where sql, free form having sql, structured where clauses and structured
+    having clauses.
+    """
+    adhoc_filters = fd.get('adhoc_filters', None)
+    if isinstance(adhoc_filters, list):
+        simple_where_filters = []
+        simple_having_filters = []
+        sql_where_filters = []
+        sql_having_filters = []
+        for adhoc_filter in adhoc_filters:
+            expression_type = adhoc_filter.get('expressionType')
+            clause = adhoc_filter.get('clause')
+            if expression_type == 'SIMPLE':
+                if clause == 'WHERE':
+                    simple_where_filters.append({
+                        'col': adhoc_filter.get('subject'),
+                        'op': adhoc_filter.get('operator'),
+                        'val': adhoc_filter.get('comparator'),
+                    })
+                elif clause == 'HAVING':
+                    simple_having_filters.append({
+                        'col': adhoc_filter.get('subject'),
+                        'op': adhoc_filter.get('operator'),
+                        'val': adhoc_filter.get('comparator'),
+                    })
+            elif expression_type == 'SQL':
+                if clause == 'WHERE':
+                    sql_where_filters.append(adhoc_filter.get('sqlExpression'))
+                elif clause == 'HAVING':
+                    sql_having_filters.append(adhoc_filter.get('sqlExpression'))
+        fd['where'] = ' AND '.join(['({})'.format(sql) for sql in sql_where_filters])
+        fd['having'] = ' AND '.join(['({})'.format(sql) for sql in sql_having_filters])
+        fd['having_filters'] = simple_having_filters
+        fd['filters'] = simple_where_filters
+
+
+def get_username():
+    """Get username if within the flask context, otherwise return noffin'"""
+    try:
+        return g.user.username
+    except Exception:
+        pass

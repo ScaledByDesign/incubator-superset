@@ -1,5 +1,5 @@
 import sinon from 'sinon';
-import * as actions from '../../../javascripts/SqlLab/actions';
+import * as actions from '../../../src/SqlLab/actions';
 
 export const mockedActions = sinon.stub(Object.assign({}, actions));
 
@@ -319,15 +319,18 @@ export const runningQuery = {
 export const cachedQuery = Object.assign({}, queries[0], { cached: true });
 
 export const initialState = {
-  alerts: [],
-  queries: {},
-  databases: {},
-  queryEditors: [defaultQueryEditor],
-  tabHistory: [defaultQueryEditor.id],
-  tables: [],
-  workspaceQueries: [],
-  queriesLastUpdate: 0,
-  activeSouthPaneTab: 'Results',
+  sqlLab: {
+    alerts: [],
+    queries: {},
+    databases: {},
+    queryEditors: [defaultQueryEditor],
+    tabHistory: [defaultQueryEditor.id],
+    tables: [],
+    workspaceQueries: [],
+    queriesLastUpdate: 0,
+    activeSouthPaneTab: 'Results',
+  },
+  messageToasts: [],
 };
 
 export const query = {

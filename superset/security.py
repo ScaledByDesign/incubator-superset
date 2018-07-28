@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pylint: disable=C,R,W
 """A set of constants and methods to manage permissions and security"""
 from __future__ import absolute_import
 from __future__ import division
@@ -115,6 +116,18 @@ class SupersetSecurityManager(SecurityManager):
             self.schema_access(datasource, user=user) or
             self.can_access('datasource_access', datasource.perm, user=user)
         )
+
+    def get_datasource_access_error_msg(self, datasource):
+        return """This endpoint requires the datasource {}, database or
+            `all_datasource_access` permission""".format(datasource.name)
+
+    def get_datasource_access_link(self, datasource):
+        from superset import conf
+        return conf.get('PERMISSION_INSTRUCTIONS_LINK')
+
+    def get_table_access_error_msg(self, table_name):
+        return """You need access to the following tables: {}, all database access or
+              `all_datasource_access` permission""".format(table_name)
 
     def datasource_access_by_name(
             self, database, datasource_name, schema=None):
